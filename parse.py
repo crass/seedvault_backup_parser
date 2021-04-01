@@ -5,6 +5,7 @@ import sys
 import json
 import getpass
 import glob
+import shutil
 import string
 import struct
 import hashlib
@@ -176,6 +177,12 @@ def parse_backup(backupfolder, targetfolder, key):
     # only decrypt apps into a folder, never print, since they might be huge
     if targetfolder:
         parse_full_app_backups(backupfolder, targetfolder, key)
+
+        print("Copying apk files")
+        apks = sorted(glob.glob(f"{backupfolder}/*.apk"))
+        for apk in apks:
+            shutil.copy2(apk, targetfolder)
+
     else:
         print("Skipping full app backup decryption, since they might be too large to show. Use the DECRYPT option")
 
