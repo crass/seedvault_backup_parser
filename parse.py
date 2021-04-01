@@ -2,6 +2,7 @@
 import re
 import os
 import sys
+import json
 import getpass
 import glob
 import string
@@ -304,6 +305,11 @@ def create_versionheader(appname, key=None):
 # reencrypts key-value pairs from a decrypted backup, so they can be flashed to the device
 def encrypt_backup(plainfolder, targetfolder, userkey):
     assert targetfolder
+
+    with open(f"{plainfolder}/.backup.metadata") as f:
+      metadata = json.load(f)
+    token = metadata["@meta@"]["token"]
+    targetfolder += '/' + str(token)
 
     os.makedirs(f"{targetfolder}/kv", exist_ok=True)
     kvs = sorted(glob.glob(f"{plainfolder}/kv/*"))
