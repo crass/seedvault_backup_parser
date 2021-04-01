@@ -295,8 +295,8 @@ def create_versionheader(appname, key=None):
     assert len(appname) < 255
     data += struct.pack(">H", len(appname))
     data += appname.encode()
+    data += struct.pack(">H", len(key or ""))
     if key:
-        data += struct.pack(">H", len(key))
         data += key
     return data
 
