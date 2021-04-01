@@ -5,6 +5,7 @@ import sys
 import json
 import getpass
 import glob
+import shutil
 import string
 import struct
 import hashlib
@@ -98,11 +99,16 @@ def parse_kv_backup(backupfolder, targetfolder, userkey):
 
 
 # just prints all apk names found
-def parse_apk_backup(backupfolder):
+def parse_apk_backup(backupfolder, targetfolder=None):
     apks = sorted(glob.glob(f"{backupfolder}/*.apk"))
-    print("Found apks: ")
-    for apk in apks:
-        print("  "+"/".join(apk.split("/")[1:]))
+    if targetfolder is None:
+        print("Found apks: ")
+        for apk in apks:
+            print("  "+"/".join(apk.split("/")[1:]))
+    else:
+        print("Copying apk files")
+        for apk in apks:
+            shutil.copy2(apk, targetfolder)
 
 
 # parses the full app backups, stored in the "full" subfolder
@@ -165,7 +171,7 @@ def parse_backup(backupfolder, targetfolder, key):
         os.makedirs(targetfolder, exist_ok=True)
 
     parse_metadata(backupfolder, targetfolder, key)
-    parse_apk_backup(backupfolder)
+    parse_apk_backup(backupfolder, targetfolder)
 
     kv_parsed = parse_kv_backup(backupfolder, targetfolder, key)
     if targetfolder == None:
