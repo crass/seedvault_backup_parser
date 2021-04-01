@@ -350,6 +350,34 @@ def encrypt_backup(plainfolder, targetfolder, userkey):
             with open(f"{targetfolder}/kv/{appname}/{keyb64.replace('=', '')}", "wb") as f:
                 f.write(ct)
 
+    os.makedirs(f"{targetfolder}/full", exist_ok=True)
+    fulls = sorted(glob.glob(f"{plainfolder}/full/*"))
+
+    print("Encrypting Full backup files: ")
+    for full in fulls:
+        appid = full.split("/")[-1]
+        print("  for app "+appid, full)
+
+        with open(f"{targetfolder}/full/{appid}", "wb") as wf:
+            with open(full, "rb") as f:
+                pt = f.read()
+
+            ct = b""
+            # version is 0
+            ct += b"\0"
+
+            versionheader_bytes = create_versionheader(appid)
+            ct += encrypt_segment(versionheader_bytes, userkey)
+            # encrypt the plaintext
+            ct += encrypt_segments(pt, userkey)
+
+            wf.write(ct)
+
+    print("Copying apk files")
+    apks = sorted(glob.glob(f"{plainfolder}/*.apk"))
+    for apk in apks:
+        shutil.copy2(apk, targetfolder)
+
     print("Encrypting Metadata file")
     with open(f"{plainfolder}/.backup.metadata", "rb") as f:
         meta = f.read()
