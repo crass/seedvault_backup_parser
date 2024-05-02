@@ -32,391 +32,412 @@ except:
 
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 
-# separator can't be in urlsafe b64 alphabet. -> no A-Za-Z0-9-_ -> choose .
-B64_SEPARATOR = "."
+
+#
+class SeedVaultBackupBase(object):
+    # separator can't be in urlsafe b64 alphabet. -> no A-Za-Z0-9-_ -> choose .
+    B64_SEPARATOR = "."
+
+    METADATA_FILE = ".backup.metadata"
+
+    def __init__(self):
+        raise RuntimeError("Abstract Base Class")
+
+    # parses file-path, where file is a base64 encoded key into the decoded filenam
+    @classmethod
+    def filepath_to_key(cls, filepath):
+        filename = filepath.split("/")[-1]
+
+        # seedvault removes padding =, add them back, else python complains
+        return urlsafe_b64decode(filename + "=" * ((4 - len(filename) % 4) % 4))
 
 
-# parses file-path, where file is a base64 encoded key into the decoded filename
-def filepath_to_key(filepath):
-    filename = filepath.split("/")[-1]
+class SeedVaultBackup(SeedVaultBackupBase):
 
-    # seedvault removes padding =, add them back, else python complains
-    return urlsafe_b64decode(filename + "=" * ((4 - len(filename) % 4) % 4))
+    def __init__(self, password=None):
+        self.password=password
+
+    # parses key-value pairs stored in the "kv" subfolder
+    # see KVBackup.kt
+    def parse_kv_backup(self, backupfolder, targetfolder, userkey):
+        kvs = sorted(glob.glob(f"{backupfolder}/kv/*"))
+        #print("Found kv folders: ")
+        #for kv in kvs:
+        #    print("  "+"/".join(kv.split("/")[2:]))
+
+        print("Decrypting Key-Value files: ")
+        kv_parsed = {}
+        for kv in kvs:
+            appname = kv.split("/")[-1]
+            print("  for app "+appname)
+            pairsb64 = glob.glob(kv+"/*")
+
+            if targetfolder:
+                os.makedirs(f"{targetfolder}/kv/{appname}", exist_ok=True)
+
+            # verbose: dump all found paths
+            if not targetfolder:
+                for p in sorted([self.filepath_to_key(p) for p in pairsb64]):
+                    print(f"    {p.decode()}")
+
+            pairs = {}
+            for p in pairsb64:
+                with open(p, "rb") as f:
+                    ct = f.read()
+
+                key = self.filepath_to_key(p)
+                b64 = urlsafe_b64encode(key)
+                version = ct[0]
+                ct = ct[1:]
+                assert version == 0 # only version 0 supported
+
+                versionheader_bytes, ct = self.decrypt_segment(ct, userkey)
+                versionheader = self.parse_versionheader(versionheader_bytes)
+
+                # if decrypted versionheader does not match folder/filename, something has gone wrong
+                #print(versionheader, appname, self.filepath_to_key(p))
+                assert versionheader['name'].decode() == appname
+                assert versionheader['key'] == key
+                assert versionheader['version'] == version
+
+                # parse all remaining segments
+                data = self.decrypt_segments(ct, userkey)
+
+                if targetfolder:
+                    # we need to save as b64, since some keys contain "/" etc
+                    whitelist = string.ascii_letters + string.digits + '.'
+                    cleanname = re.sub(f'[^{whitelist}]', '', key.decode())
+                    with open(f"{targetfolder}/kv/{appname}/{cleanname}{self.B64_SEPARATOR}{b64.decode()}", "wb") as f:
+                        f.write(data)
+
+                pairs[key] = data
+                #print(key, data, b64)
+
+            kv_parsed[appname] = pairs
+
+        return kv_parsed
 
 
-# parses key-value pairs stored in the "kv" subfolder
-# see KVBackup.kt
-def parse_kv_backup(backupfolder, targetfolder, userkey):
-    kvs = sorted(glob.glob(f"{backupfolder}/kv/*"))
-    #print("Found kv folders: ")
-    #for kv in kvs:
-    #    print("  "+"/".join(kv.split("/")[2:]))
+    # just prints all apk names found
+    def parse_apk_backup(self, backupfolder):
+        apks = sorted(glob.glob(f"{backupfolder}/*.apk"))
+        print("Found apks: ")
+        for apk in apks:
+            print("  "+"/".join(apk.split("/")[1:]))
 
-    print("Decrypting Key-Value files: ")
-    kv_parsed = {}
-    for kv in kvs:
-        appname = kv.split("/")[-1]
-        print("  for app "+appname)
-        pairsb64 = glob.glob(kv+"/*")
 
+    # parses the full app backups, stored in the "full" subfolder
+    # see FullBackup.kt::performFullBackup()
+    def parse_full_app_backups(self, backupfolder, targetfolder, userkey):
         if targetfolder:
-            os.makedirs(f"{targetfolder}/kv/{appname}", exist_ok=True)
+            os.makedirs(f"{targetfolder}/full", exist_ok=True)
+        fulls = sorted(glob.glob(f"{backupfolder}/full/*"))
+        print("Decrypting full backup for apps: ")
+        for full in fulls:
+            appname = full.split("/")[-1]
+            print("  "+appname)
 
-        # verbose: dump all found paths
-        if not targetfolder:
-            for p in sorted([filepath_to_key(p) for p in pairsb64]):
-                print(f"    {p.decode()}")
-
-        pairs = {}
-        for p in pairsb64:
-            with open(p, "rb") as f:
+            with open(full, "rb") as f:
                 ct = f.read()
 
-            key = filepath_to_key(p)
-            b64 = urlsafe_b64encode(key)
+            #key = self.filepath_to_key(p)
+            #b64 = urlsafe_b64encode(key)
             version = ct[0]
             ct = ct[1:]
             assert version == 0 # only version 0 supported
 
-            versionheader_bytes, ct = decrypt_segment(ct, userkey)
-            versionheader = parse_versionheader(versionheader_bytes)
+            versionheader_bytes, ct = self.decrypt_segment(ct, userkey)
+            versionheader = self.parse_versionheader(versionheader_bytes, False)
 
             # if decrypted versionheader does not match folder/filename, something has gone wrong
-            #print(versionheader, appname, filepath_to_key(p))
+            #print(versionheader, appname, self.filepath_to_key(p))
             assert versionheader['name'].decode() == appname
-            assert versionheader['key'] == key
             assert versionheader['version'] == version
 
             # parse all remaining segments
-            data = decrypt_segments(ct, userkey)
-
+            data = self.decrypt_segments(ct, userkey)
             if targetfolder:
-                # we need to save as b64, since some keys contain "/" etc
-                whitelist = string.ascii_letters + string.digits + '.'
-                cleanname = re.sub(f'[^{whitelist}]', '', key.decode())
-                with open(f"{targetfolder}/kv/{appname}/{cleanname}{B64_SEPARATOR}{b64.decode()}", "wb") as f:
+                with open(f"{targetfolder}/full/{appname}", "wb") as f:
                     f.write(data)
-
-            pairs[key] = data
-            #print(key, data, b64)
-
-        kv_parsed[appname] = pairs
-
-    return kv_parsed
+            else:
+                print("   Value: ", data)
+                print("\n\n\n")
 
 
-# just prints all apk names found
-def parse_apk_backup(backupfolder):
-    apks = sorted(glob.glob(f"{backupfolder}/*.apk"))
-    print("Found apks: ")
-    for apk in apks:
-        print("  "+"/".join(apk.split("/")[1:]))
-
-
-# parses the full app backups, stored in the "full" subfolder
-# see FullBackup.kt::performFullBackup()
-def parse_full_app_backups(backupfolder, targetfolder, userkey):
-    if targetfolder:
-        os.makedirs(f"{targetfolder}/full", exist_ok=True)
-    fulls = sorted(glob.glob(f"{backupfolder}/full/*"))
-    print("Decrypting full backup for apps: ")
-    for full in fulls:
-        appname = full.split("/")[-1]
-        print("  "+appname)
-
-        with open(full, "rb") as f:
+    def parse_metadata(self, backupfolder, targetfolder, key):
+        with open(f"{backupfolder}/{self.METADATA_FILE}", "rb") as f:
             ct = f.read()
 
-        #key = filepath_to_key(p)
-        #b64 = urlsafe_b64encode(key)
         version = ct[0]
-        ct = ct[1:]
-        assert version == 0 # only version 0 supported
+        assert version == 0
+        pt = self.decrypt_segments(ct[1:], key)
 
-        versionheader_bytes, ct = decrypt_segment(ct, userkey)
-        versionheader = parse_versionheader(versionheader_bytes, False)
-
-        # if decrypted versionheader does not match folder/filename, something has gone wrong
-        #print(versionheader, appname, filepath_to_key(p))
-        assert versionheader['name'].decode() == appname
-        assert versionheader['version'] == version
-
-        # parse all remaining segments
-        data = decrypt_segments(ct, userkey)
         if targetfolder:
-            with open(f"{targetfolder}/full/{appname}", "wb") as f:
-                f.write(data)
+            with open(f"{targetfolder}/{self.METADATA_FILE}", "wb") as f:
+                f.write(pt)
         else:
-            print("   Value: ", data)
-            print("\n\n\n")
+            print("Metadata:")
+            print(pt)
 
 
-def parse_metadata(backupfolder, targetfolder, key):
-    with open(f"{backupfolder}/.backup.metadata", "rb") as f:
-        ct = f.read()
+    # parses everything
+    def parse_backup(self, backupfolder, targetfolder, key=None):
+        if key is None:
+            key = self.get_key()
 
-    version = ct[0]
-    assert version == 0
-    pt = decrypt_segments(ct[1:], key)
+        if targetfolder:
+            os.makedirs(targetfolder, exist_ok=True)
 
-    if targetfolder:
-        with open(f"{targetfolder}/.backup.metadata", "wb") as f:
-            f.write(pt)
-    else:
-        print("Metadata:")
-        print(pt)
+        self.parse_metadata(backupfolder, targetfolder, key)
+        self.parse_apk_backup(backupfolder)
+
+        kv_parsed = self.parse_kv_backup(backupfolder, targetfolder, key)
+        if targetfolder == None:
+            self.print_kv_pairs(kv_parsed)
+
+        print("\n\n")
+
+        # only decrypt apps into a folder, never print, since they might be huge
+        if targetfolder:
+            self.parse_full_app_backups(backupfolder, targetfolder, key)
+
+            print("Copying apk files")
+            apks = sorted(glob.glob(f"{backupfolder}/*.apk"))
+            for apk in apks:
+                shutil.copy2(apk, targetfolder)
+
+        else:
+            print("Skipping full app backup decryption, since they might be too large to show. Use the DECRYPT option")
+
+        return kv_parsed
 
 
-# parses everything
-def parse_backup(backupfolder, targetfolder, key):
-    if targetfolder:
-        os.makedirs(targetfolder, exist_ok=True)
+    # "pretty" prints all found key-value pairs
+    def print_kv_pairs(self, kv):
+        for app, pairs in kv.items():
+            print("------------------------------------------------------\n")
+            for key, value in pairs.items():
+                print(f"APP: {app}\t\tKEY: {key.decode()}")
+                print(value)
+                print()
 
-    parse_metadata(backupfolder, targetfolder, key)
-    parse_apk_backup(backupfolder)
 
-    kv_parsed = parse_kv_backup(backupfolder, targetfolder, key)
-    if targetfolder == None:
-        print_kv_pairs(kv_parsed)
+    # takes a single segment, decrypts it. Returns trailing data (other segments)
+    # segment consists of
+    # 2  Bytes - Segment length x
+    # 12 Bytes - IV used for encryption
+    # x  Bytes - Encrypted Data (of which last 16 bytes are aes-gcm-tag)
+    def decrypt_segment(self, ct, key):
+        # parse segment header to get iv and segment length
+        length = struct.unpack(">h", ct[:2])[0]
+        assert len(ct[2:]) >= length
+        remainder = ct[2+12+length:]
+        iv = ct[2:2+12]
+        ct = ct[2+12:2+12+length]
 
-    print("\n\n")
+        # use iv from segment header to decrypt
+        pt = self.aes_decrypt(ct, key, iv)
 
-    # only decrypt apps into a folder, never print, since they might be huge
-    if targetfolder:
-        parse_full_app_backups(backupfolder, targetfolder, key)
+        #print(length, iv, ct)
+        return pt, remainder
+
+
+    # decrypt multiple consecutive segments
+    def decrypt_segments(self, ct, key):
+        data = b""
+        while ct:
+            pt, ct = self.decrypt_segment(ct, key)
+            data += pt
+        return data
+
+
+    # decrypt a ciphertext with aesgcm and verify its tag. Last 16 bytes of ct are tag
+    def aes_decrypt(self, ct, key, iv):
+        TAG_LEN = 128//8
+        cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+        tag = ct[-TAG_LEN:]
+        try:
+            pt = cipher.decrypt_and_verify(ct[:-TAG_LEN], tag)
+        except ValueError as e:
+            print(e)
+            print("Could not decrypt data! Is your key correct?")
+            sys.exit(-1)
+        return pt
+
+
+    # encrypt a ciphertext with aesgcm. Last 16 bytes of ct are tag
+    def aes_encrypt(self, pt, key, iv):
+        TAG_LEN = 128//8
+        cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+        ct, tag = cipher.encrypt_and_digest(pt)
+        return ct + tag
+
+
+    # encrypts a segment, creates random iv and correct header
+    def encrypt_segment(self, pt, key):
+        # create segment header
+        # length of cipher text and following tag (16 bytes) must fit into 15 bits
+        # because the android code reads it as a signed short.
+        assert len(pt) + 16 < 2**15, f"Encryption block must be less than {(2**15)-16}, was {len(pt)}"
+        header = struct.pack(">h", len(pt) + 16)
+        iv = os.urandom(12) # random IV
+        header += iv
+
+        ct = self.aes_encrypt(pt, key, iv)
+
+        return header + ct
+
+    # encrypt multiple consecutive segments
+    # blocksize defaults to maximum segment data size. Segment length is 2 bytes,
+    # but read as a signed short, so 15bits, and subtract the 16 byte auth tag.
+    def encrypt_segments(self, pt, key, blocksize=(2**15)-(16+1)):
+        ct = b""
+        for i in range(0, len(pt), blocksize):
+            ct += self.encrypt_segment(pt[i:i+blocksize], key)
+        return ct
+
+    # Version Header is:
+    # 1 Byte  - Version
+    # 2 Bytes - Packagename length x
+    # x Bytes - Packagename
+    # 2 Bytes - Keyname length y
+    # y Bytes - Keyname
+    #
+    # see HeaderWriter.kt
+    def parse_versionheader(self, vb, include_key=True):
+        version = vb[0]
+        namelen = struct.unpack(">H", vb[1:3])[0]
+        name = vb[3:3+namelen]
+        key = None
+        if include_key:
+          keylen = struct.unpack(">H", vb[3+namelen:3+namelen+2])[0]
+          assert len(vb) == namelen + keylen + 2 + 2 + 1
+          key = vb[3+2+namelen:]
+        return {
+            "version": version,
+            "name": name,
+            "key": key,
+        }
+
+
+    def create_versionheader(self, appname, key=None):
+        data = b"\0" # version
+        assert len(appname) < 255
+        data += struct.pack(">H", len(appname))
+        data += appname.encode()
+        data += struct.pack(">H", len(key or ""))
+        if key:
+            data += key
+        return data
+
+
+    # reencrypts key-value pairs from a decrypted backup, so they can be flashed to the device
+    def encrypt_backup(self, plainfolder, targetfolder, userkey=None):
+        assert targetfolder
+
+        if userkey is None:
+            userkey = self.get_key()
+
+        with open(f"{plainfolder}/{self.METADATA_FILE}") as f:
+          metadata = json.load(f)
+        token = metadata["@meta@"]["token"]
+        targetfolder += '/' + str(token)
+
+        os.makedirs(f"{targetfolder}/kv", exist_ok=True)
+        kvs = sorted(glob.glob(f"{plainfolder}/kv/*"))
+
+        print("Encrypting Key-Value files: ")
+        for kv in kvs:
+            appname = kv.split("/")[-1]
+            print("  for app "+appname, kv)
+            pairsb64 = glob.glob(kv+"/*")
+            os.makedirs(f"{targetfolder}/kv/{appname}", exist_ok=True)
+
+            for p in pairsb64:
+                with open(p, "rb") as f:
+                    pt = f.read()
+
+                # file has to have an B64_SEPARATOR followed by the base64 of the key!
+                keyb64 = p.split(self.B64_SEPARATOR)[-1]
+                print(keyb64)
+                key = urlsafe_b64decode(keyb64)
+                print("    ", key)
+
+                ct = b""
+                # version is 0
+                ct += b"\0"
+
+                versionheader_bytes = self.create_versionheader(appname, key)
+                ct += self.encrypt_segment(versionheader_bytes, userkey)
+                # encrypt the plaintext
+                ct += self.encrypt_segments(pt, userkey)
+
+                with open(f"{targetfolder}/kv/{appname}/{keyb64.replace('=', '')}", "wb") as f:
+                    f.write(ct)
+
+        os.makedirs(f"{targetfolder}/full", exist_ok=True)
+        fulls = sorted(glob.glob(f"{plainfolder}/full/*"))
+
+        print("Encrypting Full backup files: ")
+        for full in fulls:
+            appid = full.split("/")[-1]
+            print("  for app "+appid, full)
+
+            with open(f"{targetfolder}/full/{appid}", "wb") as wf:
+                with open(full, "rb") as f:
+                    pt = f.read()
+
+                ct = b""
+                # version is 0
+                ct += b"\0"
+
+                versionheader_bytes = self.create_versionheader(appid)
+                ct += self.encrypt_segment(versionheader_bytes, userkey)
+                # encrypt the plaintext
+                ct += self.encrypt_segments(pt, userkey)
+
+                wf.write(ct)
 
         print("Copying apk files")
-        apks = sorted(glob.glob(f"{backupfolder}/*.apk"))
+        apks = sorted(glob.glob(f"{plainfolder}/*.apk"))
         for apk in apks:
             shutil.copy2(apk, targetfolder)
 
-    else:
-        print("Skipping full app backup decryption, since they might be too large to show. Use the DECRYPT option")
+        print("Encrypting Metadata file")
+        with open(f"{plainfolder}/{self.METADATA_FILE}", "rb") as f:
+            meta = f.read()
+
+        metac = b"\0" + self.encrypt_segment(meta, userkey)
+        with open(f"{targetfolder}/{self.METADATA_FILE}", "wb") as f:
+            f.write(metac)
+
+        print("Done.")
 
 
-    return kv_parsed
+    # generate the key from a user-input mnemonic phrase
+    # uses the same algorithms as seedvault, see
+    # https://github.com/NovaCrypto/BIP39/blob/master/src/main/java/io/github/novacrypto/bip39/SeedCalculator.java
+    # https://github.com/NovaCrypto/BIP39/blob/master/src/main/java/io/github/novacrypto/bip39/JavaxPBKDF2WithHmacSHA512.java
+    def get_key(self, mnemonic=None):
+        salt = b"mnemonic"
+        rounds = 2048
+        keysize = 256
 
+        if mnemonic is None:
+            mnemonic = self.password
 
-# "pretty" prints all found key-value pairs
-def print_kv_pairs(kv):
-    for app, pairs in kv.items():
-        print("------------------------------------------------------\n")
-        for key, value in pairs.items():
-            print(f"APP: {app}\t\tKEY: {key.decode()}")
-            print(value)
-            print()
+        if mnemonic is None:
+            vis = input("Should mnemonic be visible while typing? [y/n]: ")
+            if vis.lower().startswith("y"):
+                 mnemonic = input("Please enter mnemonic: ").encode()
+            else:
+                mnemonic = getpass.getpass("Please enter mnemonic: ").encode()
 
+        if pybip39:
+            pybip39.Mnemonic.validate(mnemonic.decode('ascii'))
 
-# takes a single segment, decrypts it. Returns trailing data (other segments)
-# segment consists of
-# 2  Bytes - Segment length x
-# 12 Bytes - IV used for encryption
-# x  Bytes - Encrypted Data (of which last 16 bytes are aes-gcm-tag)
-def decrypt_segment(ct, key):
-    # parse segment header to get iv and segment length
-    length = struct.unpack(">h", ct[:2])[0]
-    assert len(ct[2:]) >= length
-    remainder = ct[2+12+length:]
-    iv = ct[2:2+12]
-    ct = ct[2+12:2+12+length]
-
-    # use iv from segment header to decrypt
-    pt = aes_decrypt(ct, key, iv)
-
-    #print(length, iv, ct)
-    return pt, remainder
-
-
-# decrypt multiple consecutive segments
-def decrypt_segments(ct, key):
-    data = b""
-    while ct:
-        pt, ct = decrypt_segment(ct, key)
-        data += pt
-    return data
-
-
-# decrypt a ciphertext with aesgcm and verify its tag. Last 16 bytes of ct are tag
-def aes_decrypt(ct, key, iv):
-    TAG_LEN = 128//8
-    cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
-    tag = ct[-TAG_LEN:]
-    try:
-        pt = cipher.decrypt_and_verify(ct[:-TAG_LEN], tag)
-    except ValueError as e:
-        print(e)
-        print("Could not decrypt data! Is your key correct?")
-        sys.exit(-1)
-    return pt
-
-
-# encrypt a ciphertext with aesgcm. Last 16 bytes of ct are tag
-def aes_encrypt(pt, key, iv):
-    TAG_LEN = 128//8
-    cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
-    ct, tag = cipher.encrypt_and_digest(pt)
-    return ct + tag
-
-
-# encrypts a segment, creates random iv and correct header
-def encrypt_segment(pt, key):
-    # create segment header
-    # length of cipher text and following tag (16 bytes) must fit into 15 bits
-    # because the android code reads it as a signed short.
-    assert len(pt) + 16 < 2**15, f"Encryption block must be less than {(2**15)-16}, was {len(pt)}"
-    header = struct.pack(">h", len(pt) + 16)
-    iv = os.urandom(12) # random IV
-    header += iv
-
-    ct = aes_encrypt(pt, key, iv)
-
-    return header + ct
-
-# encrypt multiple consecutive segments
-# blocksize defaults to maximum segment data size. Segment length is 2 bytes,
-# but read as a signed short, so 15bits, and subtract the 16 byte auth tag.
-def encrypt_segments(pt, key, blocksize=(2**15)-(16+1)):
-    ct = b""
-    for i in range(0, len(pt), blocksize):
-        ct += encrypt_segment(pt[i:i+blocksize], key)
-    return ct
-
-# Version Header is:
-# 1 Byte  - Version
-# 2 Bytes - Packagename length x
-# x Bytes - Packagename
-# 2 Bytes - Keyname length y
-# y Bytes - Keyname
-#
-# see HeaderWriter.kt
-def parse_versionheader(vb, include_key=True):
-    version = vb[0]
-    namelen = struct.unpack(">H", vb[1:3])[0]
-    name = vb[3:3+namelen]
-    key = None
-    if include_key:
-      keylen = struct.unpack(">H", vb[3+namelen:3+namelen+2])[0]
-      assert len(vb) == namelen + keylen + 2 + 2 + 1
-      key = vb[3+2+namelen:]
-    return {
-        "version": version,
-        "name": name,
-        "key": key,
-    }
-
-
-def create_versionheader(appname, key=None):
-    data = b"\0" # version
-    assert len(appname) < 255
-    data += struct.pack(">H", len(appname))
-    data += appname.encode()
-    data += struct.pack(">H", len(key or ""))
-    if key:
-        data += key
-    return data
-
-
-# reencrypts key-value pairs from a decrypted backup, so they can be flashed to the device
-def encrypt_backup(plainfolder, targetfolder, userkey):
-    assert targetfolder
-
-    with open(f"{plainfolder}/.backup.metadata") as f:
-      metadata = json.load(f)
-    token = metadata["@meta@"]["token"]
-    targetfolder += '/' + str(token)
-
-    os.makedirs(f"{targetfolder}/kv", exist_ok=True)
-    kvs = sorted(glob.glob(f"{plainfolder}/kv/*"))
-
-    print("Encrypting Key-Value files: ")
-    for kv in kvs:
-        appname = kv.split("/")[-1]
-        print("  for app "+appname, kv)
-        pairsb64 = glob.glob(kv+"/*")
-        os.makedirs(f"{targetfolder}/kv/{appname}", exist_ok=True)
-
-        for p in pairsb64:
-            with open(p, "rb") as f:
-                pt = f.read()
-
-            # file has to have an B64_SEPARATOR followed by the base64 of the key!
-            keyb64 = p.split(B64_SEPARATOR)[-1]
-            print(keyb64)
-            key = urlsafe_b64decode(keyb64)
-            print("    ", key)
-
-            ct = b""
-            # version is 0
-            ct += b"\0"
-
-            versionheader_bytes = create_versionheader(appname, key)
-            ct += encrypt_segment(versionheader_bytes, userkey)
-            # encrypt the plaintext
-            ct += encrypt_segments(pt, userkey)
-
-            with open(f"{targetfolder}/kv/{appname}/{keyb64.replace('=', '')}", "wb") as f:
-                f.write(ct)
-
-    os.makedirs(f"{targetfolder}/full", exist_ok=True)
-    fulls = sorted(glob.glob(f"{plainfolder}/full/*"))
-
-    print("Encrypting Full backup files: ")
-    for full in fulls:
-        appid = full.split("/")[-1]
-        print("  for app "+appid, full)
-
-        with open(f"{targetfolder}/full/{appid}", "wb") as wf:
-            with open(full, "rb") as f:
-                pt = f.read()
-
-            ct = b""
-            # version is 0
-            ct += b"\0"
-
-            versionheader_bytes = create_versionheader(appid)
-            ct += encrypt_segment(versionheader_bytes, userkey)
-            # encrypt the plaintext
-            ct += encrypt_segments(pt, userkey)
-
-            wf.write(ct)
-
-    print("Copying apk files")
-    apks = sorted(glob.glob(f"{plainfolder}/*.apk"))
-    for apk in apks:
-        shutil.copy2(apk, targetfolder)
-
-    print("Encrypting Metadata file")
-    with open(f"{plainfolder}/.backup.metadata", "rb") as f:
-        meta = f.read()
-
-    metac = b"\0" + encrypt_segment(meta, userkey)
-    with open(f"{targetfolder}/.backup.metadata", "wb") as f:
-        f.write(metac)
-
-    print("Done.")
-
-
-# generate the key from a user-input mnemonic phrase
-# uses the same algorithms as seedvault, see
-# https://github.com/NovaCrypto/BIP39/blob/master/src/main/java/io/github/novacrypto/bip39/SeedCalculator.java
-# https://github.com/NovaCrypto/BIP39/blob/master/src/main/java/io/github/novacrypto/bip39/JavaxPBKDF2WithHmacSHA512.java
-def get_key(mnemonic=None):
-    salt = b"mnemonic"
-    rounds = 2048
-    keysize = 256
-
-    if mnemonic is None:
-        vis = input("Should mnemonic be visible while typing? [y/n]: ")
-        if vis.lower().startswith("y"):
-             mnemonic = input("Please enter mnemonic: ").encode()
-        else:
-            mnemonic = getpass.getpass("Please enter mnemonic: ").encode()
-
-    if pybip39:
-        pybip39.Mnemonic.validate(mnemonic.decode('ascii'))
-
-    key = hashlib.pbkdf2_hmac("sha512", mnemonic, salt, rounds)
-    return key[:keysize//8]
+        key = hashlib.pbkdf2_hmac("sha512", mnemonic, salt, rounds)
+        return key[:keysize//8]
 
 
 def main():
@@ -444,21 +465,19 @@ def main():
     if args.password:
         args.password = bytes(args.password, 'ascii')
 
+    svb = SeedVaultBackup(password=args.password)
+
     if args.action == "show":
-        targetfolder = None
         print(f"Parsing backup {args.backupfolder}")
-        userkey = get_key(args.password)
-        kv_parsed = parse_backup(args.backupfolder, args.targetfolder, userkey)
+        kv_parsed = svb.parse_backup(args.backupfolder, args.targetfolder)
 
     elif args.action == "decrypt":
         print(f"Decrypting backup from {args.backupfolder} into {args.targetfolder}")
-        userkey = get_key(args.password)
-        kv_parsed = parse_backup(args.backupfolder, args.targetfolder, userkey)
+        kv_parsed = svb.parse_backup(args.backupfolder, args.targetfolder)
 
     elif args.action == "encrypt":
         print(f"Encrypting backup from {args.plainfolder} into {args.targetfolder}")
-        userkey = get_key(args.password)
-        kv_parsed = encrypt_backup(args.plainfolder, args.targetfolder, userkey)
+        kv_parsed = svb.encrypt_backup(args.plainfolder, args.targetfolder)
 
 
 if __name__ == "__main__":
