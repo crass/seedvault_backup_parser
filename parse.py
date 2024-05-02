@@ -400,16 +400,17 @@ def encrypt_backup(plainfolder, targetfolder, userkey):
 # uses the same algorithms as seedvault, see
 # https://github.com/NovaCrypto/BIP39/blob/master/src/main/java/io/github/novacrypto/bip39/SeedCalculator.java
 # https://github.com/NovaCrypto/BIP39/blob/master/src/main/java/io/github/novacrypto/bip39/JavaxPBKDF2WithHmacSHA512.java
-def get_key():
+def get_key(mnemonic=None):
     salt = b"mnemonic"
     rounds = 2048
     keysize = 256
 
-    vis = input("Should mnemonic be visible while typing? [y/n]: ")
-    if vis.lower().startswith("y"):
-         mnemonic = input("Please enter mnemonic: ").encode()
-    else:
-        mnemonic = getpass.getpass("Please enter mnemonic: ").encode()
+    if mnemonic is None:
+        vis = input("Should mnemonic be visible while typing? [y/n]: ")
+        if vis.lower().startswith("y"):
+             mnemonic = input("Please enter mnemonic: ").encode()
+        else:
+            mnemonic = getpass.getpass("Please enter mnemonic: ").encode()
 
     if pybip39:
         pybip39.Mnemonic.validate(mnemonic.decode('ascii'))
@@ -422,6 +423,7 @@ def main():
     parser = argparse.ArgumentParser(
         description='Work with SeedVault backups')
     subparsers = parser.add_subparsers(help='sub-command help')
+    parser.add_argument('-p', '--password', default=None, help='backup password')
 
     show_sparser = subparsers.add_parser('show')
     show_sparser.add_argument('backupfolder', type=str, help='path to SeedVault backup')
@@ -439,21 +441,23 @@ def main():
     encrypt_sparser.set_defaults(action="encrypt")
 
     args = parser.parse_args()
+    if args.password:
+        args.password = bytes(args.password, 'ascii')
 
     if args.action == "show":
         targetfolder = None
         print(f"Parsing backup {args.backupfolder}")
-        userkey = get_key()
+        userkey = get_key(args.password)
         kv_parsed = parse_backup(args.backupfolder, args.targetfolder, userkey)
 
     elif args.action == "decrypt":
         print(f"Decrypting backup from {args.backupfolder} into {args.targetfolder}")
-        userkey = get_key()
+        userkey = get_key(args.password)
         kv_parsed = parse_backup(args.backupfolder, args.targetfolder, userkey)
 
     elif args.action == "encrypt":
         print(f"Encrypting backup from {args.plainfolder} into {args.targetfolder}")
-        userkey = get_key()
+        userkey = get_key(args.password)
         kv_parsed = encrypt_backup(args.plainfolder, args.targetfolder, userkey)
 
 
