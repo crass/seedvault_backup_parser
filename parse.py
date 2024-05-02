@@ -10,6 +10,12 @@ import string
 import struct
 import hashlib
 
+try:
+    # If pybip39 is available use it to add additional verification
+    import pybip39
+except:
+    pybip39 = None
+
 # debian does not ship pycryptodome under the pycrypto namespace. Try both.
 # See Issue #8
 try:
@@ -403,6 +409,10 @@ def get_key():
          mnemonic = input("Please enter mnemonic: ").encode()
     else:
         mnemonic = getpass.getpass("Please enter mnemonic: ").encode()
+
+    if pybip39:
+        pybip39.Mnemonic.validate(mnemonic.decode('ascii'))
+
     key = hashlib.pbkdf2_hmac("sha512", mnemonic, salt, rounds)
     return key[:keysize//8]
 
