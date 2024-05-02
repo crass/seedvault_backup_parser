@@ -2,6 +2,7 @@
 import re
 import os
 import sys
+import argparse
 import json
 import getpass
 import glob
@@ -417,32 +418,42 @@ def get_key():
 
 
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: %s SHOW    [BACKUPFOLDER]" % sys.argv[0])
-        print("       %s DECRYPT [BACKUPFOLDER] [TARGETFOLDER]" % sys.argv[0])
-        print("       %s ENCRYPT [PLAINFOLDER]  [TARGETFOLDER] (only KV support right now)" % sys.argv[0])
-        sys.exit(-1)
+    parser = argparse.ArgumentParser(
+        description='Work with SeedVault backups')
+    subparsers = parser.add_subparsers(help='sub-command help')
 
-    backupfolder = sys.argv[2]
+    show_sparser = subparsers.add_parser('show')
+    show_sparser.add_argument('backupfolder', type=str, help='path to SeedVault backup')
+    show_sparser.set_defaults(targetfolder=None)
+    show_sparser.set_defaults(action="show")
 
-    if sys.argv[1].lower() == "show":
+    decrypt_sparser = subparsers.add_parser('decrypt')
+    decrypt_sparser.add_argument('backupfolder', help='path to SeedVault backup')
+    decrypt_sparser.add_argument('targetfolder', help='path to put decrypted SeedVault backup')
+    decrypt_sparser.set_defaults(action="decrypt")
+
+    encrypt_sparser = subparsers.add_parser('encrypt')
+    encrypt_sparser.add_argument('plainfolder', help='path to decrypted SeedVault backup')
+    encrypt_sparser.add_argument('targetfolder', help='path to put re-encrypted SeedVault backup')
+    encrypt_sparser.set_defaults(action="encrypt")
+
+    args = parser.parse_args()
+
+    if args.action == "show":
         targetfolder = None
-        print(f"Parsing backup {backupfolder}")
+        print(f"Parsing backup {args.backupfolder}")
         userkey = get_key()
-        kv_parsed = parse_backup(backupfolder, targetfolder, userkey)
+        kv_parsed = parse_backup(args.backupfolder, args.targetfolder, userkey)
 
-    elif sys.argv[1].lower() == "decrypt":
-        targetfolder = sys.argv[3]
-        print(f"Decrypting backup from {backupfolder} into {targetfolder}")
+    elif args.action == "decrypt":
+        print(f"Decrypting backup from {args.backupfolder} into {args.targetfolder}")
         userkey = get_key()
-        kv_parsed = parse_backup(backupfolder, targetfolder, userkey)
+        kv_parsed = parse_backup(args.backupfolder, args.targetfolder, userkey)
 
-    elif sys.argv[1].lower() == "encrypt":
-        plainfolder = sys.argv[2]
-        targetfolder = sys.argv[3]
-        print(f"Encrypting backup from {plainfolder} into {targetfolder}")
+    elif args.action == "encrypt":
+        print(f"Encrypting backup from {args.plainfolder} into {args.targetfolder}")
         userkey = get_key()
-        kv_parsed = encrypt_backup(plainfolder, targetfolder, userkey)
+        kv_parsed = encrypt_backup(args.plainfolder, args.targetfolder, userkey)
 
 
 if __name__ == "__main__":
