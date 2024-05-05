@@ -52,13 +52,23 @@ from base64 import urlsafe_b64decode, urlsafe_b64encode
 
 #
 class SeedVaultBackupBase(object):
-    # separator can't be in urlsafe b64 alphabet. -> no A-Za-Z0-9-_ -> choose .
-    B64_SEPARATOR = "."
-
     METADATA_FILE = ".backup.metadata"
 
     def __init__(self):
         raise RuntimeError("Abstract Base Class")
+
+    @classmethod
+    def get_version(cls, backupfolder):
+        meta_path = os.path.join(backupfolder, cls.METADATA_FILE)
+        if not os.path.exists(meta_path):
+            raise RuntimeError(f"Not a SeedVault backup: {backupfolder}")
+
+        with open(meta_path, "rb") as f:
+            try:
+                return json.load(f)["@meta@"]["version"]
+            except:
+                f.seek(0)
+                return ord(f.read(1))
 
     # parses file-path, where file is a base64 encoded key into the decoded filenam
     @classmethod
@@ -68,11 +78,54 @@ class SeedVaultBackupBase(object):
         # seedvault removes padding =, add them back, else python complains
         return urlsafe_b64decode(filename + "=" * ((4 - len(filename) % 4) % 4))
 
+    def get_password(self, mnemonic=None):
+        if mnemonic is None:
+            mnemonic = self.password
 
-class SeedVaultBackup(SeedVaultBackupBase):
+        if mnemonic is None:
+            vis = input("Should mnemonic be visible while typing? [y/n]: ")
+            if vis.lower().startswith("y"):
+                mnemonic = input("Please enter mnemonic: ")
+            else:
+                mnemonic = getpass.getpass("Please enter mnemonic: ")
 
-    def __init__(self, password=None):
-        self.password=password
+        if pybip39:
+            pybip39.Mnemonic.validate(mnemonic)
+
+        return mnemonic.encode()
+
+
+class SeedVaultBackupBaseV0(SeedVaultBackupBase):
+    # separator can't be in urlsafe b64 alphabet. -> no A-Za-Z0-9-_ -> choose .
+    B64_SEPARATOR = "."
+
+    # generate the key from a user-input mnemonic phrase
+    # uses the same algorithms as seedvault, see
+    # https://github.com/NovaCrypto/BIP39/blob/master/src/main/java/io/github/novacrypto/bip39/SeedCalculator.java
+    # https://github.com/NovaCrypto/BIP39/blob/master/src/main/java/io/github/novacrypto/bip39/JavaxPBKDF2WithHmacSHA512.java
+    def get_key(self, mnemonic=None):
+        salt = b"mnemonic"
+        rounds = 2048
+        keysize = 256
+
+        key = hashlib.pbkdf2_hmac("sha512", self.get_password(mnemonic), salt, rounds)
+        return key[:keysize//8]
+
+
+#############################################################
+##### Decryptors
+#############################################################
+class SeedVaultBackupDecryptorV0(SeedVaultBackupBaseV0):
+
+    def __init__(self, backupdir, targetdir=None, password=None):
+        self.backupdir = backupdir
+        self.targetdir = targetdir
+        self.password = password
+
+
+    def decrypt(self):
+        return self.parse_backup(self.backupdir, self.targetdir)
+
 
     # parses key-value pairs stored in the "kv" subfolder
     # see KVBackup.kt
@@ -197,6 +250,30 @@ class SeedVaultBackup(SeedVaultBackupBase):
             print(pt)
 
 
+    # Version Header is:
+    # 1 Byte  - Version
+    # 2 Bytes - Packagename length x
+    # x Bytes - Packagename
+    # 2 Bytes - Keyname length y
+    # y Bytes - Keyname
+    #
+    # see HeaderWriter.kt
+    def parse_versionheader(self, vb, include_key=True):
+        version = vb[0]
+        namelen = struct.unpack(">H", vb[1:3])[0]
+        name = vb[3:3+namelen]
+        key = None
+        if include_key:
+          keylen = struct.unpack(">H", vb[3+namelen:3+namelen+2])[0]
+          assert len(vb) == namelen + keylen + 2 + 2 + 1
+          key = vb[3+2+namelen:]
+        return {
+            "version": version,
+            "name": name,
+            "key": key,
+        }
+
+
     # parses everything
     def parse_backup(self, backupfolder, targetfolder, key=None):
         if key is None:
@@ -282,6 +359,29 @@ class SeedVaultBackup(SeedVaultBackupBase):
         return pt
 
 
+def SeedVaultBackupDecryptor(*args, **kwargs):
+    version = SeedVaultBackupBase.get_version(args[0])
+    if version == 0:
+        klass = SeedVaultBackupDecryptorV0
+    else:
+        raise RuntimeError(f"Unsupported version: {version}")
+    return klass(*args, **kwargs)
+
+
+#############################################################
+##### Encryptors
+#############################################################
+class SeedVaultBackupEncryptorV0(SeedVaultBackupBaseV0):
+    def __init__(self, plaindir, targetdir=None, password=None):
+        self.plaindir = plaindir
+        self.targetdir = targetdir
+        self.password = password
+
+
+    def encrypt(self):
+        return self.encrypt_backup(self.plaindir, self.targetdir)
+
+
     # encrypt a ciphertext with aesgcm. Last 16 bytes of ct are tag
     def aes_encrypt(self, pt, key, iv):
         TAG_LEN = 128//8
@@ -312,29 +412,6 @@ class SeedVaultBackup(SeedVaultBackupBase):
         for i in range(0, len(pt), blocksize):
             ct += self.encrypt_segment(pt[i:i+blocksize], key)
         return ct
-
-    # Version Header is:
-    # 1 Byte  - Version
-    # 2 Bytes - Packagename length x
-    # x Bytes - Packagename
-    # 2 Bytes - Keyname length y
-    # y Bytes - Keyname
-    #
-    # see HeaderWriter.kt
-    def parse_versionheader(self, vb, include_key=True):
-        version = vb[0]
-        namelen = struct.unpack(">H", vb[1:3])[0]
-        name = vb[3:3+namelen]
-        key = None
-        if include_key:
-          keylen = struct.unpack(">H", vb[3+namelen:3+namelen+2])[0]
-          assert len(vb) == namelen + keylen + 2 + 2 + 1
-          key = vb[3+2+namelen:]
-        return {
-            "version": version,
-            "name": name,
-            "key": key,
-        }
 
 
     def create_versionheader(self, appname, key=None):
@@ -431,31 +508,16 @@ class SeedVaultBackup(SeedVaultBackupBase):
         print("Done.")
 
 
-    # generate the key from a user-input mnemonic phrase
-    # uses the same algorithms as seedvault, see
-    # https://github.com/NovaCrypto/BIP39/blob/master/src/main/java/io/github/novacrypto/bip39/SeedCalculator.java
-    # https://github.com/NovaCrypto/BIP39/blob/master/src/main/java/io/github/novacrypto/bip39/JavaxPBKDF2WithHmacSHA512.java
-    def get_key(self, mnemonic=None):
-        salt = b"mnemonic"
-        rounds = 2048
-        keysize = 256
+def SeedVaultBackupEncryptor(*args, **kwargs):
+    version = SeedVaultBackupBase.get_version(args[0])
+    if version == 0:
+        klass = SeedVaultBackupEncryptorV0
+    else:
+        raise RuntimeError(f"Unsupported version: {version}")
+    return klass(*args, **kwargs)
 
-        if mnemonic is None:
-            mnemonic = self.password
 
-        if mnemonic is None:
-            vis = input("Should mnemonic be visible while typing? [y/n]: ")
-            if vis.lower().startswith("y"):
-                 mnemonic = input("Please enter mnemonic: ").encode()
-            else:
-                mnemonic = getpass.getpass("Please enter mnemonic: ").encode()
-
-        if pybip39:
-            pybip39.Mnemonic.validate(mnemonic.decode('ascii'))
-
-        key = hashlib.pbkdf2_hmac("sha512", mnemonic, salt, rounds)
-        return key[:keysize//8]
-
+#############################################################
 
 def main():
     parser = argparse.ArgumentParser(
@@ -479,22 +541,18 @@ def main():
     encrypt_sparser.set_defaults(action="encrypt")
 
     args = parser.parse_args()
-    if args.password:
-        args.password = bytes(args.password, 'ascii')
-
-    svb = SeedVaultBackup(password=args.password)
 
     if args.action == "show":
         print(f"Parsing backup {args.backupfolder}")
-        kv_parsed = svb.parse_backup(args.backupfolder, args.targetfolder)
+        kv_parsed = SeedVaultBackupDecryptor(args.backupfolder, password=args.password).decrypt()
 
     elif args.action == "decrypt":
         print(f"Decrypting backup from {args.backupfolder} into {args.targetfolder}")
-        kv_parsed = svb.parse_backup(args.backupfolder, args.targetfolder)
+        kv_parsed = SeedVaultBackupDecryptor(args.backupfolder, args.targetfolder, password=args.password).decrypt()
 
     elif args.action == "encrypt":
         print(f"Encrypting backup from {args.plainfolder} into {args.targetfolder}")
-        kv_parsed = svb.encrypt_backup(args.plainfolder, args.targetfolder)
+        kv_parsed = SeedVaultBackupEncryptor(args.plainfolder, args.targetfolder, password=args.password).encrypt()
 
 
 if __name__ == "__main__":
