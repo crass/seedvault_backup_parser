@@ -19,7 +19,10 @@
 import re
 import os
 import sys
+import io
+import itertools
 import argparse
+import codecs
 import json
 import getpass
 import glob
@@ -27,6 +30,9 @@ import shutil
 import string
 import struct
 import hashlib
+import gzip
+
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 
 try:
     # If pybip39 is available use it to add additional verification
@@ -37,17 +43,113 @@ except:
 # debian does not ship pycryptodome under the pycrypto namespace. Try both.
 # See Issue #8
 try:
+    from Crypto.Hash import SHA256
     from Crypto.Cipher import AES
     AES.MODE_GCM
 except:
     try:
+        from Cryptodome.Hash import SHA256
         from Cryptodome.Cipher import AES
         AES.MODE_GCM
     except:
         print("ERROR: Please install pycryptodome.")
         exit(-1)
 
-from base64 import urlsafe_b64decode, urlsafe_b64encode
+
+# This is what SeedVault V1 backups are using under it all
+try:
+    import tink
+    from tink import streaming_aead
+    streaming_aead.register()
+except tink.TinkError as e:
+    print(f"Error initialising Tink: {e}", file=sys.stderr)
+    exit(1)
+
+
+try:
+    # TODO: Perhaps have BackupSnapshot protobuf defined in this file
+    from proto.backup_snapshot_pb2 import BackupSnapshot
+    DECRYPT_SNAPSHOTS = True
+except Exception as e:
+    print(f"Unable to decrypt snapshots: {e}")
+    DECRYPT_SNAPSHOTS = False
+
+
+# Stolen from pycryptodome.Protocol.KDF.HKDF()
+# See: https://github.com/Legrandin/pycryptodome/blob/master/lib/Crypto/Protocol/KDF.py#L281
+# Allow expansion only mode when onlyexpand evals to True.
+# TODO: Send a PR to pycryptodome adding the onlyexpand modification
+from Crypto.Hash import HMAC
+def HKDF(master, key_len, salt, hashmod, num_keys=1, context=None, onlyexpand=False):
+    output_len = key_len * num_keys
+    if output_len > (255 * hashmod.digest_size):
+        raise ValueError("Too much secret data to derive")
+    if not salt:
+        salt = b'\x00' * hashmod.digest_size
+    if context is None:
+        context = b""
+
+    # Step 1: extract
+    if not onlyexpand:
+        hmac = HMAC.new(salt, master, digestmod=hashmod)
+        prk = hmac.digest()
+    else:
+        prk = master
+
+    # Step 2: expand
+    t = [ b"" ]
+    n = 1
+    tlen = 0
+    while tlen < output_len:
+        hmac = HMAC.new(prk, t[-1] + context + struct.pack('B', n), digestmod=hashmod)
+        t.append(hmac.digest())
+        tlen += hashmod.digest_size
+        n += 1
+    derived_output = b"".join(t)
+    if num_keys == 1:
+        return derived_output[:key_len]
+    kol = [derived_output[idx:idx + key_len]
+           for idx in iter_range(0, output_len, key_len)]
+    return list(kol[:num_keys])
+
+
+def tink_key_protos_from_keyset_proto(keyset_proto: tink.proto.tink_pb2.Keyset):
+    """
+        Given a KeySet protocol buffer return the class for the Key protocol buffer
+    """
+    import importlib
+
+    key_pb_classes = []
+    for key_pb in keyset_proto.key:
+        key_name = keyset_proto.key[0].key_data.type_url.split('.')[-1]
+        key_name_snake = key_name.translate(dict([(ord(c), '_'+c.lower()) for c in string.ascii_uppercase]))
+        module_name = key_name_snake[1:key_name_snake.rfind('_')] + '_pb2'
+        key_pb_mod = importlib.import_module('tink.proto.' + module_name)
+        key_pb_classes.append(getattr(key_pb_mod, key_name))
+    return key_pb_classes
+
+
+from tink import _keyset_handle
+def tink_import_key(keyset_handle: _keyset_handle.KeysetHandle, *keys: bytes):
+    """
+        Return a KeysetHandle of the same type as keyset_handle filled
+        key material.
+    """
+    from tink import _insecure_keyset_handle
+    from tink import secret_key_access
+
+    # Get the protobuf
+    keyset_proto = _insecure_keyset_handle.to_proto_keyset(keyset_handle, secret_key_access.TOKEN)
+    assert len(keyset_proto.key) == len(keys)
+
+    for key, key_pb, key_proto_class in zip(keys, keyset_proto.key, tink_key_protos_from_keyset_proto(keyset_proto)):
+        key_proto = key_proto_class()
+        key_proto.ParseFromString(key_pb.key_data.value)
+        key_proto.key_value = key
+        key_pb.key_data.value = key_proto.SerializeToString()
+
+    keyset_handle = _insecure_keyset_handle.from_proto_keyset(keyset_proto, secret_key_access.TOKEN)
+    return keyset_handle
 
 
 #
@@ -110,6 +212,80 @@ class SeedVaultBackupBaseV0(SeedVaultBackupBase):
 
         key = hashlib.pbkdf2_hmac("sha512", self.get_password(mnemonic), salt, rounds)
         return key[:keysize//8]
+
+
+class SeedVaultBackupBaseV1(SeedVaultBackupBase):
+    ALGORITHM_HMAC = "HmacSHA256"
+    KEY_SIZE = 256
+    KEY_SIZE_BYTES = KEY_SIZE / 8
+    SIZE_SEGMENT = 1 << 20
+    INFO_STREAM_KEY = b"stream key"
+    APPDATA_STREAM_KEY = b"app data key"
+
+    TYPE_METADATA = 0x00
+    TYPE_BACKUP_KV = 0x01
+    TYPE_BACKUP_FULL = 0x02
+    TYPE_CHUNK = 0x00
+    TYPE_SNAPSHOT = 0x01
+
+    def get_key(self, mnemonic=None, context=APPDATA_STREAM_KEY):
+        salt = b"mnemonic"
+        # See: https://github.com/seedvault-app/seedvault/blob/android14/app/src/main/java/com/stevesoltys/seedvault/crypto/Crypto.kt#L125
+        rounds = 2048
+        keysize = 256
+
+        # See: https://github.com/Electric-Coin-Company/kotlin-bip39/blob/main/bip39-lib/src/commonMain/kotlin/cash/z/ecc/android/bip39/Mnemonics.kt#L309
+        seed = hashlib.pbkdf2_hmac("sha512", self.get_password(mnemonic), salt, rounds)
+
+        # The seed is comprised first the backup key, then the main key
+        # See: https://github.com/seedvault-app/seedvault/blob/android14/app/src/main/java/com/stevesoltys/seedvault/crypto/KeyManager.kt#L76
+        mainkey = seed[keysize//8:]
+
+        # Only do an HKDF expansion
+        # See: https://github.com/seedvault-app/seedvault/blob/android14/storage/lib/src/main/java/org/calyxos/backup/storage/crypto/StreamCrypto.kt#L31
+        # Where the expansion is defined here:
+        # https://github.com/seedvault-app/seedvault/blob/android14/storage/lib/src/main/java/org/calyxos/backup/storage/crypto/Hkdf.kt
+        key = HKDF(mainkey, keysize//8, None, SHA256, context=context, onlyexpand=True)
+
+        return key[:keysize//8]
+
+    def get_stream_key(self):
+        return self.get_key(context=self.INFO_STREAM_KEY)
+
+    def getAD(self, version, ctype, bytestr = b''):
+        # getAD: get AD (associated data)
+        # See: app/src/main/java/com/stevesoltys/seedvault/metadata/Metadata.kt#L11
+        # NOTE: Java is big-endian
+        adbuf = struct.pack(">BB", version, ctype) + bytestr
+        return adbuf
+
+
+    def getChunkAD(self, version, chunkid):
+        # getAD: get AD (associated data) for chunks
+        # See: storage/lib/src/main/java/org/calyxos/backup/storage/crypto/StreamCrypto.kt#L43
+        # NOTE: Java is big-endian
+        assert len(codecs.decode(chunkid, 'hex')) == self.KEY_SIZE_BYTES, len(codecs.decode(chunkid, 'hex'))
+        return struct.pack(">BB", version, self.TYPE_CHUNK) + codecs.decode(chunkid, 'hex')
+
+
+    def getSnapshotAD(self, version, timestamp):
+        # getAD: get AD (associated data) for snapshots
+        # See: storage/lib/src/main/java/org/calyxos/backup/storage/crypto/StreamCrypto.kt#L43
+        # NOTE: Java is big-endian
+        return struct.pack(">BBQ", version, self.TYPE_SNAPSHOT, timestamp)
+
+
+    def get_cipher(self, input_file, key, adbuf):
+        # 1. Get a handle to the key material
+        keyset_handle = tink.new_keyset_handle(
+            streaming_aead.streaming_aead_key_templates.AES256_GCM_HKDF_1MB)
+        keyset_handle = tink_import_key(keyset_handle, key)
+
+        # 2. Get the primitive.
+        streaming_aead_primitive = keyset_handle.primitive(streaming_aead.StreamingAead)
+
+        # 3. Return stream decryptor.
+        return streaming_aead_primitive.new_decrypting_stream(input_file, adbuf)
 
 
 #############################################################
@@ -359,10 +535,253 @@ class SeedVaultBackupDecryptorV0(SeedVaultBackupBaseV0):
         return pt
 
 
+class SeedVaultBackupDecryptorV1(SeedVaultBackupBaseV1):
+
+    def __init__(self, backupdir, targetdir=None, password=None):
+        self.backupdir = backupdir
+        self.targetdir = targetdir
+        self.password = password
+
+
+    def decrypt(self):
+        return self.parse_backup(self.backupdir, self.targetdir)
+
+
+    # See: app/src/main/java/com/stevesoltys/seedvault/crypto/Crypto.kt#L115
+    def parse_metadata(self, backupfolder, targetfolder, key):
+        f = open(f"{backupfolder}/{self.METADATA_FILE}", "rb")
+        version = ord(f.read(1))
+        assert version == 1, version
+
+        output_file = io.BytesIO()
+        adbuf = self.getAD(version, self.TYPE_METADATA) + \
+            struct.pack(">Q", int(os.path.basename(backupfolder.rstrip(os.sep))))
+        scipher = self.get_cipher(f, key, adbuf)
+
+        with scipher as dec_stream:
+            bytes_read = dec_stream.read()
+            output_file.write(bytes_read)
+        metadata = json.loads(output_file.getvalue())
+    #    print(f"metadata json = {json.dumps(metadata, indent=2)}")
+        assert version == metadata["@meta@"]["version"]
+
+        if targetfolder:
+            with open(f"{targetfolder}/{self.METADATA_FILE}", "wb") as f:
+                f.write(output_file.getvalue())
+        else:
+            print("Metadata:\n{json.dumps(metadata, indent=2)}")
+
+        return metadata
+
+
+    def parse_apk_data_backup(self, pkg_name, pkg_metadata, key, salt):
+        if 'backupType' not in pkg_metadata:
+            print(f"Skipping parsing apk {pkg_name}")
+            return
+
+        print(f"Parsing apk {pkg_name}")
+
+        h = hashlib.sha256((salt + pkg_name).encode()).digest()
+        pkg_path = os.path.join(self.backupdir.encode(), urlsafe_b64encode(h).rstrip(b'='))
+
+        if not os.path.exists(pkg_path):
+            print(f"Skipping, pkg path not exist: {pkg_path}")
+            return
+
+        # Decrypt package data
+        with open(pkg_path, 'rb') as f:
+            version = ord(f.read(1))
+            assert version == 1, version
+
+            btype = None
+            if pkg_metadata["backupType"] == "KV":
+                btype = self.TYPE_BACKUP_KV
+                bext = '.sqlite'
+            if pkg_metadata["backupType"] == "FULL":
+                btype = self.TYPE_BACKUP_FULL
+                bext = '.tar'
+
+            output_file = io.BytesIO()
+            adbuf = self.getAD(version, btype, pkg_name.encode())
+            scipher = self.get_cipher(f, key, adbuf)
+
+            with scipher as dec_stream:
+                bytes_read = dec_stream.read()
+                output_file.write(bytes_read)
+
+            output_file.seek(0)
+            if btype == self.TYPE_BACKUP_KV:
+                output_file = gzip.GzipFile(fileobj=output_file)
+
+            if self.targetdir:
+                output_path = os.path.join(self.targetdir, pkg_name + bext)
+                with open(output_path, 'wb') as f:
+                    f.write(output_file.read())
+            else:
+                print(f"{pkg_name}: {output_file.read(100)}")
+
+
+    def parse_apk_backup(self, pkg_name, pkg_metadata, key, salt):
+        self.parse_apk_data_backup(pkg_name, pkg_metadata, key, salt)
+
+        for splitname, sha256val in [('', pkg_metadata.get('sha256', None))] + [(s['name'], s['sha256']) for s in pkg_metadata.get('splits', [])]:
+            h = hashlib.sha256((salt + "APK" + pkg_name + splitname).encode()).digest()
+            apk_path = os.path.join(self.backupdir.encode(), urlsafe_b64encode(h).rstrip(b'='))
+
+            if not os.path.exists(apk_path):
+                print(f"Skipping, apk path not exist: {apk_path}")
+                return
+
+            # APKs are not encrypted
+            print(f"Validating APK: {apk_path}")
+            with open(apk_path, 'rb') as f:
+                # Verify that the hash checks out
+                h = urlsafe_b64encode(hashlib.sha256(f.read()).digest())
+                if sha256val is None or h.decode('ascii').rstrip('=') == sha256val:
+#                    print(f"APK {pkg_name} passed hash check")
+                    if self.targetdir:
+                        if splitname:
+                            filename = pkg_name + '.' + splitname + ".apk"
+                        else:
+                            filename = pkg_name + ".apk"
+                        shutil.copy2(apk_path, os.path.join(self.targetdir, filename))
+                else:
+                    print(f"APK {pkg_name} failed hash check")
+
+
+    def parse_chunk(self, snapdir, chunkid, key=None, zipindex=None):
+        chunk_path = os.path.join(snapdir, chunkid[:2], chunkid)
+        assert os.path.exists(chunk_path), chunk_path
+
+        if key is None:
+            key = self.get_stream_key()
+
+        output_file = io.BytesIO()
+        with open(chunk_path, 'rb') as f:
+            version = ord(f.read(1))
+            #assert version == 1, version
+
+            adbuf = self.getChunkAD(version, chunkid)
+            scipher = self.get_cipher(f, key, adbuf)
+            with scipher as dec_stream:
+                bytes_read = dec_stream.read()
+                output_file.write(bytes_read)
+
+            if zipindex > 0:
+                import zipfile
+                output_file.seek(0)
+                assert zipfile.is_zipfile(output_file), output_file.getvalue()[:100]
+                output_file.seek(0)
+                zf = zipfile.ZipFile(output_file)
+                chunk = zf.read(str(zipindex))
+            else:
+                chunk = output_file.getvalue()
+
+        return chunk
+
+
+    def parse_snapshot(self, snapdir, timestamp):
+        snap_path = os.path.join(self.backupdir, snapdir, str(timestamp) + '.SeedSnap')
+        print(f"Parsing snapshot {snap_path}")
+        key = self.get_stream_key()
+
+        with open(snap_path, 'rb') as f:
+            version = ord(f.read(1))
+#            assert version == 1, version
+
+            adbuf = self.getSnapshotAD(version, timestamp)
+            scipher = self.get_cipher(f, key, adbuf)
+
+            output_file = io.BytesIO()
+            with scipher as dec_stream:
+                bytes_read = dec_stream.read()
+                output_file.write(bytes_read)
+
+        bsnap = BackupSnapshot()
+        bsnap.ParseFromString(output_file.getvalue())
+        print(f"BackupSnapshot: {len(bsnap.media_files)}, {len(bsnap.document_files)}\n{bsnap}")
+
+        from google.protobuf import json_format
+        if self.targetdir:
+            snapmeta_path = os.path.join(self.targetdir, str(timestamp) + '.SeedSnap')
+            with open(snapmeta_path, 'wb') as f:
+                f.write(json_format.MessageToJson(bsnap).encode())
+
+        # See: splitSnapshot in storage/lib/src/main/java/org/calyxos/backup/storage/restore/FileSplitter.kt
+        for mfile in itertools.chain(bsnap.media_files, bsnap.document_files):
+            print(f"Media backupfile: {os.path.join(mfile.path, mfile.name)}")
+            if self.targetdir:
+                dir_path = os.path.join(self.targetdir, str(timestamp), mfile.path)
+                os.makedirs(dir_path, exist_ok=True)
+                file_path = os.path.join(dir_path, mfile.name)
+
+                if not os.path.exists(file_path) or mfile.size != os.path.getsize(file_path):
+                    with open(file_path, 'wb') as f:
+                        for chunkid in mfile.chunk_ids:
+                            f.write(self.parse_chunk(snapdir, chunkid, key=key, zipindex=mfile.zip_index))
+
+                os.utime(file_path, times=(mfile.last_modified//1000, mfile.last_modified//1000))
+                assert mfile.size == os.path.getsize(file_path), mfile.size
+
+
+    def find_snapshots(self, backupfolder=None):
+        dir_re = re.compile(r"^[a-f0-9]{16}\.sv$")
+        snapshot_re = re.compile(r"([0-9]{13})\.SeedSnap")
+
+        if backupfolder is None:
+            backupfolder = self.backupdir
+        root = os.path.dirname(backupfolder)
+        print(f"Looking for snapshots in {root}")
+        for dirname in os.listdir(root):
+            print(f"Checking {dirname} for snapshots")
+            if dir_re.match(dirname):
+                print(f"Looking for snapshots in {dirname}")
+                for name in os.listdir(os.path.join(root, dirname)):
+                    m = snapshot_re.match(name)
+                    if m:
+                        timestamp = int(m.group(1))
+                        print(f"Found snapshot with timestamp: {timestamp}")
+                        yield (os.path.join(root, dirname), timestamp)
+
+
+    def parse_snapshots(self, backupfolder=None):
+        if backupfolder is None:
+            backupfolder = self.backupdir
+
+        for snapdir, timestamp in self.find_snapshots(backupfolder):
+            self.parse_snapshot(snapdir, timestamp)
+
+
+    # parses everything
+    def parse_backup(self, backupfolder, targetfolder, key=None):
+        if key is None:
+            key = self.get_key()
+
+        if targetfolder:
+            os.makedirs(targetfolder, exist_ok=True)
+
+        metadata = self.parse_metadata(backupfolder, targetfolder, key)
+
+        # Extract APKs and backup data
+        salt = metadata['@meta@']['salt']
+        for pkg_name, pkg_metadata in metadata.items():
+            if pkg_name in ("@meta@", "@end@"): # @pm@ ???
+                continue
+
+            self.parse_apk_backup(pkg_name, pkg_metadata, key, salt)
+
+        # Extract snapshots
+        global DECRYPT_SNAPSHOTS
+        if DECRYPT_SNAPSHOTS:
+            self.parse_snapshots()
+
+
 def SeedVaultBackupDecryptor(*args, **kwargs):
     version = SeedVaultBackupBase.get_version(args[0])
     if version == 0:
         klass = SeedVaultBackupDecryptorV0
+    elif version == 1:
+        klass = SeedVaultBackupDecryptorV1
     else:
         raise RuntimeError(f"Unsupported version: {version}")
     return klass(*args, **kwargs)
@@ -508,10 +927,27 @@ class SeedVaultBackupEncryptorV0(SeedVaultBackupBaseV0):
         print("Done.")
 
 
+class SeedVaultBackupEncryptorV1(SeedVaultBackupBaseV1):
+    def __init__(self, plaindir, targetdir=None, password=None):
+        self.plaindir = plaindir
+        self.targetdir = targetdir
+        self.password = password
+
+
+    def encrypt(self):
+        return self.encrypt_backup(self.plaindir, self.targetdir)
+
+
+    def encrypt_backup(self, plainfolder, targetfolder, userkey=None):
+        raise NotImplementedError
+
+
 def SeedVaultBackupEncryptor(*args, **kwargs):
     version = SeedVaultBackupBase.get_version(args[0])
     if version == 0:
         klass = SeedVaultBackupEncryptorV0
+    elif version == 1:
+        klass = SeedVaultBackupEncryptorV1
     else:
         raise RuntimeError(f"Unsupported version: {version}")
     return klass(*args, **kwargs)
