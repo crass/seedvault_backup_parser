@@ -1,0 +1,13 @@
+# Used in both V0 and V1 decryption/encryption
+pycryptodome
+
+# Needed for V1 support
+tink
+
+# Used to display KV data from an in-memory sqlite3 db.
+# Starting with python 3.11, this can be done with python's built-in
+# sqlite3 module
+apsw ; python_version < "3.11"
+
+# Used for extra mnemonic validation
+pybip39
