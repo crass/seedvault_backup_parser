@@ -31,6 +31,7 @@ import string
 import struct
 import hashlib
 import gzip
+import datetime
 import logging
 
 logging.basicConfig(format='%(message)s', stream=sys.stdout, level=logging.WARNING)
@@ -755,7 +756,9 @@ class SeedVaultBackupDecryptorV1(SeedVaultBackupBaseV1):
 
     def parse_snapshot(self, snapdir, timestamp):
         snap_path = os.path.join(self.backupdir, snapdir, str(timestamp) + '.SeedSnap')
-        print(f"  Parsing snapshot {snap_path}")
+        ts_str = datetime.datetime.fromtimestamp(timestamp//1000).isoformat()
+        snap_name = f"{ts_str}.{str(timestamp)}"
+        print(f"  Parsing snapshot {os.path.join(snapdir, str(timestamp))} {ts_str}")
         key = self.get_stream_key()
 
         with open(snap_path, 'rb') as f:
@@ -776,7 +779,7 @@ class SeedVaultBackupDecryptorV1(SeedVaultBackupBaseV1):
 
         from google.protobuf import json_format
         if self.targetdir:
-            snapmeta_path = os.path.join(self.targetdir, str(timestamp) + '.SeedSnap')
+            snapmeta_path = os.path.join(self.targetdir, f"{snap_name}.SeedSnap")
             with open(snapmeta_path, 'wb') as f:
                 f.write(json_format.MessageToJson(bsnap).encode())
             logger.info(f"  Wrote snapshot metadata to {snapmeta_path}")
@@ -786,7 +789,7 @@ class SeedVaultBackupDecryptorV1(SeedVaultBackupBaseV1):
         for mfile in itertools.chain(bsnap.media_files, bsnap.document_files):
             print(f"    {os.path.join(mfile.path, mfile.name)}")
             if self.targetdir:
-                dir_path = os.path.join(self.targetdir, str(timestamp), mfile.path)
+                dir_path = os.path.join(self.targetdir, snap_name, mfile.path)
                 os.makedirs(dir_path, exist_ok=True)
                 file_path = os.path.join(dir_path, mfile.name)
 
