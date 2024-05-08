@@ -674,6 +674,17 @@ class SeedVaultBackupDecryptorV1(SeedVaultBackupBaseV1):
                 kv = self.get_kv_dict(output_file.read(), output_path)
                 if kv:
                     logger.debug(f"    kv: {json.dumps(kv, indent=6, cls=JSONBytesEncoder)}")
+            if btype == self.TYPE_BACKUP_FULL:
+                import tarfile
+                output_file.seek(0)
+                assert tarfile.is_tarfile(output_file)
+                if logger.getEffectiveLevel() <= logging.DEBUG:
+                    tf = tarfile.open(fileobj=output_file)
+                    for info in tf:
+                        import time
+                        mtime = "%d-%02d-%02d %02d:%02d:%02d" \
+                            % time.localtime(info.mtime)[:6]
+                        logger.debug(f'      {info.size:10d} {mtime} {info.name + ("/" if info.isdir() else "")}')
 
 
     def parse_apk_backup(self, pkg_name, pkg_metadata, key, salt):
