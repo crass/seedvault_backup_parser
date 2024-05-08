@@ -607,6 +607,38 @@ class SeedVaultBackupDecryptorV1(SeedVaultBackupBaseV1):
         return metadata
 
 
+    def parse_settings_dict(self, bytestr, lensz=4):
+        """Parse particular KV settings of the format:
+            {len}{key string}{len}{value string}...{null}
+            See: https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/packages/SettingsProvider/src/com/android/providers/settings/SettingsBackupAgent.java;drc=edc28c0a73d18e18583252daaada966bfae4cba5;l=1041
+        """
+        if lensz == 4:
+            fmt = ">I"
+        elif lensz == 2:
+            fmt = ">H"
+        else:
+            raise RuntimeError(f"Unallowed length size: {lensz}")
+        settings = {}
+        while bytestr:
+            l = struct.unpack(fmt, bytestr[:lensz])[0]
+            if l == 0:
+                break
+            key = bytestr[lensz:lensz+l].decode('utf8')
+            bytestr = bytestr[lensz+l:]
+            l = struct.unpack(fmt, bytestr[:lensz])[0]
+            value = bytestr[lensz:lensz+l]
+            if key == 'nfc_payment_default_component':
+                logger.debug(f"{value[0]!r} {value!r}")
+            if value and value[0] == 0:
+                value = self.parse_settings_dict(value, lensz)
+            else:
+                value = value.decode('utf8')
+            settings[key] = value
+            bytestr = bytestr[lensz+l:]
+
+        return settings
+
+
     def get_kv_dict(self, sqlite_bytes, sqlite_path=None):
         if sys.version_info.major >= 3 and sys.version_info.minor >= 11:
             import sqlite3
@@ -675,6 +707,13 @@ class SeedVaultBackupDecryptorV1(SeedVaultBackupBaseV1):
                 output_file.seek(0)
                 kv = self.get_kv_dict(output_file.read(), output_path)
                 if kv:
+                    if pkg_name == 'com.android.providers.settings':
+                        # See: https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/packages/SettingsProvider/src/com/android/providers/settings/SettingsBackupAgent.java
+                        # This should show how to decode all these settings
+                        kv['lock_settings'] =  self.parse_settings_dict(kv['lock_settings'], 2)
+                        dict_cfgs = ('secure', 'global', 'system')
+                        for cfg in dict_cfgs:
+                            kv[cfg] = self.parse_settings_dict(kv[cfg])
                     logger.debug(f"    kv: {json.dumps(kv, indent=6, cls=JSONBytesEncoder)}")
             if btype == self.TYPE_BACKUP_FULL:
                 import tarfile
