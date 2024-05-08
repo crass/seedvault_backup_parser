@@ -105,5 +105,8 @@ The file `.backup.metadata` in the root of a backup contains information about w
 ## Backup Format V1
 TODO: See source for now
 
+## Other tools
+* [seedvault-extractor](https://github.com/jackwilsdon/seedvault-extractor) is a golang program for partially decrypting V1 backups.
+
 ## License
 This application is available as open source under the terms of the [Apache-2.0 License](https://opensource.org/licenses/Apache-2.0).
