@@ -39,6 +39,18 @@ logger = logging.getLogger(__name__)
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 
 try:
+    import apsw
+    import apsw.bestpractice
+    apsw.bestpractice.apply(apsw.bestpractice.recommended)
+    USE_APSW = True
+except Exception as e:
+    if sys.version_info.major < 3 or sys.version_info.minor < 11:
+        logger.warning(f"Error unable to initialize apsw: {e}")
+
+        logger.warning(f"  May not be able to print out KV data from sqlite db, though it will still be decrypted")
+    USE_APSW = False
+
+try:
     # If pybip39 is available use it to add additional verification
     import pybip39
 except:
@@ -78,6 +90,17 @@ try:
 except Exception as e:
     logger.warning(f"Unable to decrypt snapshots: {e}")
     DECRYPT_SNAPSHOTS = False
+
+
+class JSONBytesEncoder(json.JSONEncoder):
+    """Only to be used for display, decoding will give undesirable results"""
+    def default(self, o):
+        if type(o) == bytes:
+            try:
+                return o.decode('utf8')
+            except:
+                return repr(o)
+        return super().default(o)
 
 
 # Stolen from pycryptodome.Protocol.KDF.HKDF()
@@ -583,6 +606,22 @@ class SeedVaultBackupDecryptorV1(SeedVaultBackupBaseV1):
         return metadata
 
 
+    def get_kv_dict(self, sqlite_bytes, sqlite_path=None):
+        if sys.version_info.major >= 3 and sys.version_info.minor >= 11:
+            import sqlite3
+            c = sqlite3.connect(":memory:")
+            c.deserialize(sqlite_bytes)
+        elif USE_APSW:
+            c = apsw.Connection(":memory:")
+            c.deserialize('main', sqlite_bytes)
+        elif self.targetdir:
+            import sqlite3
+            c = sqlite3.connect(sqlite_path)
+        else:
+            return
+        return dict([r for r in c.execute("select * from kv_entry")])
+
+
     def parse_apk_data_backup(self, pkg_name, pkg_metadata, key, salt):
         if 'backupType' not in pkg_metadata:
             logger.warning(f"    Skipping parsing apk data: No backupType in metadata: {pkg_metadata}")
@@ -625,10 +664,17 @@ class SeedVaultBackupDecryptorV1(SeedVaultBackupBaseV1):
             if btype == self.TYPE_BACKUP_KV:
                 output_file = gzip.GzipFile(fileobj=output_file)
 
+            output_path = None
             if self.targetdir:
                 output_path = os.path.join(self.targetdir, pkg_name + bext)
                 with open(output_path, 'wb') as f:
                     f.write(output_file.read())
+
+            if btype == self.TYPE_BACKUP_KV and logger.getEffectiveLevel() <= logging.DEBUG:
+                output_file.seek(0)
+                kv = self.get_kv_dict(output_file.read(), output_path)
+                if kv:
+                    logger.debug(f"    kv: {json.dumps(kv, indent=6, cls=JSONBytesEncoder)}")
 
 
     def parse_apk_backup(self, pkg_name, pkg_metadata, key, salt):
