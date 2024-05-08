@@ -436,7 +436,7 @@ class SeedVaultBackupDecryptorV0(SeedVaultBackupBaseV0):
             # parse all remaining segments
             data = self.decrypt_segments(ct, userkey)
             if targetfolder:
-                with open(f"{targetfolder}/full/{appname}", "wb") as f:
+                with open(f"{targetfolder}/full/{appname}.tar", "wb") as f:
                     f.write(data)
             else:
                 print("   Value: ", data)
@@ -975,7 +975,8 @@ class SeedVaultBackupEncryptorV0(SeedVaultBackupBaseV0):
 
         print("Encrypting Full backup files: ")
         for full in fulls:
-            appid = full.split("/")[-1]
+            appid = full[:-4] if full.endswith('.tar') else full
+            appid = appid.split("/")[-1]
             print("  for app "+appid, full)
 
             with open(f"{targetfolder}/full/{appid}", "wb") as wf:
