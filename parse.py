@@ -690,7 +690,11 @@ class SeedVaultBackupDecryptorV1(SeedVaultBackupBaseV1):
             scipher = self.get_cipher(f, key, adbuf)
 
             with scipher as dec_stream:
-                bytes_read = dec_stream.read()
+                try:
+                    bytes_read = dec_stream.read()
+                except Exception as e:
+                    logger.error(f"    Error: Failure to decrypt {os.path.basename(pkg_path).decode()}: {e}")
+                    return
                 output_file.write(bytes_read)
 
             output_file.seek(0)
@@ -728,14 +732,7 @@ class SeedVaultBackupDecryptorV1(SeedVaultBackupBaseV1):
                         logger.debug(f'      {info.size:10d} {mtime} {info.name + ("/" if info.isdir() else "")}')
 
 
-    def parse_apk_backup(self, pkg_name, pkg_metadata, key, salt):
-        # TODO: Verify signatures
-
-        logger.info('='*60)
-        print(f"  {pkg_name}")
-
-        self.parse_apk_data_backup(pkg_name, pkg_metadata, key, salt)
-
+    def copy_apk_files(self, pkg_name, pkg_metadata, salt):
         for splitname, sha256val in [('', pkg_metadata.get('sha256', None))] + [(s['name'], s['sha256']) for s in pkg_metadata.get('splits', [])]:
             h = hashlib.sha256((salt + "APK" + pkg_name + splitname).encode()).digest()
             apk_path = os.path.join(self.backupdir.encode(), urlsafe_b64encode(h).rstrip(b'='))
@@ -761,6 +758,16 @@ class SeedVaultBackupDecryptorV1(SeedVaultBackupBaseV1):
                     logger.info(f"    APK file {filename} validated and copied")
                 else:
                     logger.warn(f"    APK failed hash check: {apk_path}")
+
+
+    def parse_apk_backup(self, pkg_name, pkg_metadata, key, salt):
+        # TODO: Verify signatures
+
+        logger.info('='*60)
+        print(f"  {pkg_name}")
+
+        self.parse_apk_data_backup(pkg_name, pkg_metadata, key, salt)
+        self.copy_apk_files(pkg_name, pkg_metadata, salt)
 
 
     def parse_chunk(self, snapdir, chunkid, key=None, zipindex=-1):
