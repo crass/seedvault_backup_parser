@@ -188,6 +188,11 @@ def tink_import_key(keyset_handle: _keyset_handle.KeysetHandle, *keys: bytes):
 class SeedVaultBackupBase(object):
     METADATA_FILE = ".backup.metadata"
 
+    FLAG_APP_DATA = 0x1
+    FLAG_APK = 0x2
+    FLAG_STORAGE = 0x4
+    FLAG_ALL = FLAG_APP_DATA | FLAG_APK | FLAG_STORAGE
+
     def __init__(self):
         raise RuntimeError("Abstract Base Class")
 
@@ -327,14 +332,15 @@ class SeedVaultBackupBaseV1(SeedVaultBackupBase):
 #############################################################
 class SeedVaultBackupDecryptorV0(SeedVaultBackupBaseV0):
 
-    def __init__(self, backupdir, targetdir=None, password=None):
+    def __init__(self, backupdir, targetdir=None, password=None, method=None):
         self.backupdir = backupdir
         self.targetdir = targetdir
         self.password = password
+        self.method = self.FLAG_ALL if method is None else method
 
 
-    def decrypt(self):
-        return self.parse_backup(self.backupdir, self.targetdir)
+    def decrypt(self, method=None):
+        return self.parse_backup(self.backupdir, self.targetdir, method=method)
 
 
     # parses key-value pairs stored in the "kv" subfolder
@@ -490,27 +496,32 @@ class SeedVaultBackupDecryptorV0(SeedVaultBackupBaseV0):
 
 
     # parses everything
-    def parse_backup(self, backupfolder, targetfolder, key=None):
+    def parse_backup(self, backupfolder, targetfolder, key=None, method=None):
         if key is None:
             key = self.get_key()
+
+        if method is None:
+            method = self.method
 
         if targetfolder:
             os.makedirs(targetfolder, exist_ok=True)
 
         self.parse_metadata(backupfolder, targetfolder, key)
-        self.parse_apk_backup(backupfolder, targetfolder)
+        if method & self.FLAG_APK:
+            self.parse_apk_backup(backupfolder, targetfolder)
 
-        kv_parsed = self.parse_kv_backup(backupfolder, targetfolder, key)
-        if targetfolder == None:
-            self.print_kv_pairs(kv_parsed)
+        if method & self.FLAG_APP_DATA:
+            kv_parsed = self.parse_kv_backup(backupfolder, targetfolder, key)
+            if targetfolder == None:
+                self.print_kv_pairs(kv_parsed)
 
-        print("\n\n")
+            print("\n\n")
 
-        # only decrypt apps into a folder, never print, since they might be huge
-        if targetfolder:
-            self.parse_full_app_backups(backupfolder, targetfolder, key)
-        else:
-            print("Skipping full app backup decryption, since they might be too large to show. Use the DECRYPT option")
+            # only decrypt apps into a folder, never print, since they might be huge
+            if targetfolder:
+                self.parse_full_app_backups(backupfolder, targetfolder, key)
+            else:
+                print("Skipping full app backup decryption, since they might be too large to show. Use the DECRYPT option")
 
         return kv_parsed
 
@@ -570,14 +581,15 @@ class SeedVaultBackupDecryptorV0(SeedVaultBackupBaseV0):
 
 class SeedVaultBackupDecryptorV1(SeedVaultBackupBaseV1):
 
-    def __init__(self, backupdir, targetdir=None, password=None):
+    def __init__(self, backupdir, targetdir=None, password=None, method=None):
         self.backupdir = backupdir
         self.targetdir = targetdir
         self.password = password
+        self.method = self.FLAG_ALL if method is None else method
 
 
-    def decrypt(self):
-        return self.parse_backup(self.backupdir, self.targetdir)
+    def decrypt(self, method=None):
+        return self.parse_backup(self.backupdir, self.targetdir, method=method)
 
 
     # See: app/src/main/java/com/stevesoltys/seedvault/crypto/Crypto.kt#L115
@@ -760,14 +772,26 @@ class SeedVaultBackupDecryptorV1(SeedVaultBackupBaseV1):
                     logger.warn(f"    APK failed hash check: {apk_path}")
 
 
-    def parse_apk_backup(self, pkg_name, pkg_metadata, key, salt):
+    def parse_apk_backup(self, pkg_name, pkg_metadata, key, salt, method=None):
         # TODO: Verify signatures
+
+        if method is None:
+            method = self.method
 
         logger.info('='*60)
         print(f"  {pkg_name}")
 
-        self.parse_apk_data_backup(pkg_name, pkg_metadata, key, salt)
-        self.copy_apk_files(pkg_name, pkg_metadata, salt)
+        try:
+            if method & self.FLAG_APP_DATA:
+                self.parse_apk_data_backup(pkg_name, pkg_metadata, key, salt)
+        except Exception as e:
+            logger.error(f"    Failure to decrypt app package data: {e}")
+
+        try:
+            if method & self.FLAG_APK:
+                self.copy_apk_files(pkg_name, pkg_metadata, salt)
+        except Exception as e:
+            logger.error(f"    Failure in copying apk files: {e}")
 
 
     def parse_chunk(self, snapdir, chunkid, key=None, zipindex=-1):
@@ -881,9 +905,12 @@ class SeedVaultBackupDecryptorV1(SeedVaultBackupBaseV1):
 
 
     # parses everything
-    def parse_backup(self, backupfolder, targetfolder, key=None):
+    def parse_backup(self, backupfolder, targetfolder, key=None, method=None):
         if key is None:
             key = self.get_key()
+
+        if method is None:
+            method = self.method
 
         if targetfolder:
             os.makedirs(targetfolder, exist_ok=True)
@@ -899,11 +926,11 @@ class SeedVaultBackupDecryptorV1(SeedVaultBackupBaseV1):
             if pkg_name in ("@meta@", "@end@"): # @pm@ ???
                 continue
 
-            self.parse_apk_backup(pkg_name, pkg_metadata, key, salt)
+            self.parse_apk_backup(pkg_name, pkg_metadata, key, salt, method=method)
 
         # Extract snapshots
         global DECRYPT_SNAPSHOTS
-        if DECRYPT_SNAPSHOTS:
+        if DECRYPT_SNAPSHOTS and method & self.FLAG_STORAGE:
             logger.info('='*60)
             self.parse_snapshots()
 
@@ -1096,16 +1123,25 @@ def main():
     parser.add_argument('-v', default=0, action='count', help='increase verbosity')
 
     show_sparser = subparsers.add_parser('show')
+    show_sparser.add_argument('-A', '--no-app-data', default=False, action='store_true', help='Do not parse app backup data')
+    show_sparser.add_argument('-P', '--no-apk', default=False, action='store_true', help='Do not parse apk files')
+    show_sparser.add_argument('-S', '--no-storage', default=False, action='store_true', help='Do not parse storage files')
     show_sparser.add_argument('backupfolder', type=str, help='path to SeedVault backup')
     show_sparser.set_defaults(targetfolder=None)
     show_sparser.set_defaults(action="show")
 
     decrypt_sparser = subparsers.add_parser('decrypt')
+    decrypt_sparser.add_argument('-A', '--no-app-data', default=False, action='store_true', help='Do not decrypt app backup data')
+    decrypt_sparser.add_argument('-P', '--no-apk', default=False, action='store_true', help='Do not copy apk files')
+    decrypt_sparser.add_argument('-S', '--no-storage', default=False, action='store_true', help='Do not decrypt storage files')
     decrypt_sparser.add_argument('backupfolder', help='path to SeedVault backup')
     decrypt_sparser.add_argument('targetfolder', help='path to put decrypted SeedVault backup')
     decrypt_sparser.set_defaults(action="decrypt")
 
     encrypt_sparser = subparsers.add_parser('encrypt')
+    encrypt_sparser.add_argument('-A', '--no-app-data', default=False, action='store_true', help='Do not encrypt app backup data')
+    encrypt_sparser.add_argument('-P', '--no-apk', default=False, action='store_true', help='Do not add apk files')
+    encrypt_sparser.add_argument('-S', '--no-storage', default=False, action='store_true', help='Do not encrypt storage files')
     encrypt_sparser.add_argument('plainfolder', help='path to decrypted SeedVault backup')
     encrypt_sparser.add_argument('targetfolder', help='path to put re-encrypted SeedVault backup')
     encrypt_sparser.set_defaults(action="encrypt")
@@ -1117,13 +1153,22 @@ def main():
     elif args.v > 0:
         logger.setLevel(logging.INFO)
 
+    method = SeedVaultBackupBase.FLAG_ALL
+    print(args)
+    if args.no_app_data:
+        method ^= SeedVaultBackupBase.FLAG_APP_DATA
+    if args.no_apk:
+        method ^= SeedVaultBackupBase.FLAG_APK
+    if args.no_storage:
+        method ^= SeedVaultBackupBase.FLAG_STORAGE
+
     if args.action == "show":
         logger.info(f"Parsing backup {args.backupfolder}")
-        kv_parsed = SeedVaultBackupDecryptor(args.backupfolder, password=args.password).decrypt()
+        kv_parsed = SeedVaultBackupDecryptor(args.backupfolder, password=args.password).decrypt(method=method)
 
     elif args.action == "decrypt":
         logger.info(f"Decrypting backup from {args.backupfolder} into {args.targetfolder}")
-        kv_parsed = SeedVaultBackupDecryptor(args.backupfolder, args.targetfolder, password=args.password).decrypt()
+        kv_parsed = SeedVaultBackupDecryptor(args.backupfolder, args.targetfolder, password=args.password).decrypt(method=method)
 
     elif args.action == "encrypt":
         logger.info(f"Encrypting backup from {args.plainfolder} into {args.targetfolder}")
